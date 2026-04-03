@@ -7,8 +7,6 @@ import (
 	"strings"
 )
 
-type EncoderInitFunc func(*WriteOptions) Encoder
-
 // WriteOptions 写入时固定头的公共参数。
 type WriteOptions struct {
 	Input    string // 输入文件路径，即需要Codec解析的原始文件路径，供 Encoder 解析使用
@@ -18,7 +16,7 @@ type WriteOptions struct {
 	BuildID  string // 原始 BuildID，由 NormalizeBuildID 规范化为 16 字节
 }
 
-func NewWriteOptions(input string, output string, ft uint8) *WriteOptions {
+func NewOptions(input string, output string, ft uint8) *WriteOptions {
 	return &WriteOptions{
 		Input:    "",
 		Output:   "",
@@ -92,16 +90,16 @@ func (c *CountingWriter) recordPatchBinding(binding PatchBinding) {
 // 固定头通过 ExtHeadSize / PayloadSize 预计算填写，
 // 后续数据由 WriteExtHead / WritePayload 直接流式输出，无中间缓冲。
 // 写入完成后依次触发 opts.OnWritten 回调和 Encoder 的 AfterWrite（若实现）。
-func Write(opts *WriteOptions, initEF EncoderInitFunc) (WriteResult, error) {
+func Write(opts *WriteOptions, f EncoderFactory) (WriteResult, error) {
 	output := opts.Output
 	// 创建或覆盖输出文件，确保写入前文件为空。
-	f, err := os.OpenFile(output, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	t, err := os.OpenFile(output, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return WriteResult{}, err
 	}
-	defer f.Close()
+	defer t.Close()
 
-	enc := initEF(opts)
+	enc := f(opts)
 
 	// 如果 opts.BuildID 为空，则调用 Encoder 的 Identify 方法来获取
 	buildID := strings.TrimSpace(opts.BuildID)
@@ -122,7 +120,7 @@ func Write(opts *WriteOptions, initEF EncoderInitFunc) (WriteResult, error) {
 		BuildID:    bid,
 	}
 
-	cw := &CountingWriter{w: f}
+	cw := &CountingWriter{w: t}
 	var result WriteResult
 
 	// 序列化固定头（栈上 32 字节，一次性写入）
@@ -160,7 +158,7 @@ func Write(opts *WriteOptions, initEF EncoderInitFunc) (WriteResult, error) {
 
 	// 触发 Encoder 自身回调（可选实现）
 	if aw, ok := enc.(AfterWriter); ok {
-		if err := aw.AfterWrite(f, result); err != nil {
+		if err := aw.AfterWrite(t, result); err != nil {
 			return result, err
 		}
 	}

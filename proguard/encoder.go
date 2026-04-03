@@ -5,6 +5,13 @@ import (
 )
 
 type Encoder struct {
+	opts *symx.WriteOptions
+}
+
+func NewEncoder(opts *symx.WriteOptions) *Encoder {
+	return &Encoder{
+		opts: opts,
+	}
 }
 
 func (e *Encoder) FileType() uint8 {

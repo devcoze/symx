@@ -1,5 +1,7 @@
 package symx
 
+type EncoderFactory func(*WriteOptions) Encoder
+
 // Encoder 是写入 SymX 文件的核心接口。
 // 接口分为两步：
 //  1. 预计算尺寸（ExtHeadSize / PayloadSize）：用于填写固定头，无需分配数据。
@@ -8,7 +10,7 @@ type Encoder interface {
 	// FileType 返回文件类型标识（SourceMap / ProGuard / Dwarf 等常量）。
 	FileType() uint8
 
-	// Identify 返回一个字符串标识，用于调试和日志输出，帮助区分不同类型的 Encoder 实现。
+	// Identify 返回一个字符串标识，用于调试和日志输出，帮助区分不同类型的 Encoder 实现。可以包含输入文件路径、内容哈希等信息，以便追踪和诊断问题。
 	Identify() string
 
 	// ExtHeadSize 返回 TLV 扩展头的字节总长，用于填写固定头中的 ExtLen 字段。

@@ -19,6 +19,7 @@ type Metadata struct {
 	Version     string `json:"Version"      symx:"38"`        // SourceMap 版本
 	SourceRoot  string `json:"SourceRoot"   symx:"40"`        // 原始Js文件所在的目录，SourceMap 的 sourceRoot 字段
 	OriFile     string `json:"OriFile"      symx:"41"`        // SourceMap 的 file 字段
+	BuildId     string `json:"BuildId"      symx:"42"`        // 原始 BuildID, 由 NormalizeBuildID 规范化之前的值，供调试和日志输出使用
 }
 
 // Line 代表一个行索引条目，包含生成行的起始和结束位置（以 0 为基准的列号）。每个 Line 条目对应于一个生成行，指示该行在生成文件中的列范围。
