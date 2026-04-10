@@ -1,19 +1,15 @@
 package smap
 
 const (
-	lineSize      = 8  // Line 条目的固定大小：Start(4) + End(4)
-	segmentSize   = 16 // Segment 条目的固定大小：GenCol(4) + SrcIdx(4) + SrcLine(4) + SrcCol(4)
-	LineOffTag    = 33
-	LineCntTag    = 34
-	SegmentOffTag = 35
-	SegmentCntTag = 36
+	lineSize    = 8  // Line 条目的固定大小：Start(4) + End(4)
+	segmentSize = 16 // Segment 条目的固定大小：GenCol(4) + SrcIdx(4) + SrcLine(4) + SrcCol(4)
 )
 
 // Metadata Js Source Map = > Symx 的头部扩展信息，包含行索引和段索引的偏移和数量，以及编译时间戳、SourceMap 版本、原始文件路径等信息。
 type Metadata struct {
-	LineOff     uint64 `json:"-"            symx:"33,update"` // 行索引在 Payload 中的偏移
+	LineOff     uint32 `json:"-"            symx:"33,update"` // 行索引在 Payload 中的偏移
 	LineCnt     uint32 `json:"-"            symx:"34,update"` // 行索引条目数量
-	SegmentOff  uint64 `json:"-"            symx:"35,update"` // 段索引在 Payload 中的偏移
+	SegmentOff  uint32 `json:"-"            symx:"35,update"` // 段索引在 Payload 中的偏移
 	SegmentCnt  uint32 `json:"-"            symx:"36,update"` // 段索引条目数量
 	CompileTime uint64 `json:"CompileTime"  symx:"37"`        // 编译时间戳
 	Version     string `json:"Version"      symx:"38"`        // SourceMap 版本

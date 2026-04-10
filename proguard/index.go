@@ -6,475 +6,452 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
+
+	"github.com/devcoze/symx"
 )
 
 // ---------------------------------------------------------------------------
-// Layer 3: Binary (High-Performance Storage)
+// 二进制索引（高性能存储）
 //
-// Produces a `mmap-friendly` binary format from IR.
-// No struct-level information — only offsets and fixed-size entries.
+// 从解析后的 AST 类流式生成 mmap 友好的二进制 Payload。
+// 不包含独立的文件头 —— 文件级别的封装由 SymX FixedHead + ExtendedHead (TLV) 管理，
+// 本层仅生成 Payload 部分。
 //
-// Layout (all little-endian):
+// Payload 布局（全部小端序）：
 //
-//   [Header]            — 64 bytes, fixed
-//   [ClassIndex]        — sorted by obfClassName hash, supports binary search
-//   [DataBlock]         — variable-length per-class data (methods, lines, frames, metadata)
-//   [StringPool]        — all interned strings, length-prefixed
+//   [DataBlock]     — 每个类的变长数据（头部、方法、字段、行号、帧、元数据）
+//   [ClassIndex]    — 按混淆类名排序，支持二分查找（16B 每条）
+//   [StringPool]    — 所有去重字符串，长度前缀编码
 //
+// 各 section 的偏移和长度存储在 ExtendedHead 的 TLV 字段中（Metadata）。
 // ---------------------------------------------------------------------------
 
-const (
-	pgidxMagic   = "PGIX"
-	pgidxVersion = 2
-	pgidxExt     = ".pgidx"
-	headerSize   = 64
-)
+// ---------------------------------------------------------------------------
+// Metadata — 存储在 ExtendedHead 中的 TLV 条目。
+//
+// 字符串字段在写入 ExtHead 时一次性写入。
+// 带 "Update" 标记的 uint32 字段初始写为 0，在 Payload 写入完成后
+// 通过 AfterWrite 回填实际值。
+// ---------------------------------------------------------------------------
 
 type Metadata struct {
+	// 文件级元数据（来自 mapping 文件头部注释）
+	Compiler        string `json:"compiler"          symx:"33"`
+	CompilerVersion string `json:"compiler_version"  symx:"34"`
+	MinAPI          string `json:"min_api"           symx:"35"`
+	Hash            string `json:"hash"              symx:"36"`
+	PGHashId        string `json:"pg_hash_id"        symx:"37"`
+
+	// Payload 各 section 的布局信息（WritePayload 完成后回填）
+	ClassCount    uint32 `symx:"40,Update"`
+	DataBlockLen  uint32 `symx:"41,Update"`
+	StringPoolLen uint32 `symx:"42,Update"`
+	TotalMethods  uint32 `symx:"43,Update"`
+	TotalLines    uint32 `symx:"44,Update"`
+	TotalMetadata uint32 `symx:"45,Update"`
 }
 
 // ---------------------------------------------------------------------------
-// Binary Header (64 bytes)
+// ClassIndex 条目（16 字节）— 按混淆类名排序，支持二分查找
 // ---------------------------------------------------------------------------
 
-// BinHeader is the file header (64 bytes).
-type BinHeader struct {
-	Magic         [4]byte  // "PGIX"
-	Version       uint32   // format version (currently 2)
-	ClassCount    uint32   // number of class index entries
-	ClassIdxOff   uint32   // offset to ClassIndex section
-	DataBlockOff  uint32   // offset to DataBlock section
-	DataBlockLen  uint32   // length of DataBlock in bytes
-	StringPoolOff uint32   // offset to StringPool section
-	StringPoolLen uint32   // length of StringPool in bytes
-	TotalMethods  uint32   // total method count (informational)
-	TotalLines    uint32   // total line mapping count (informational)
-	TotalMetadata uint32   // total metadata entry count (informational)
-	_             [20]byte // reserved, pad to 64 bytes
-}
+const classIndexEntrySize = 16
 
-// ---------------------------------------------------------------------------
-// ClassIndex entry (32 bytes) — sorted, binary-searchable
-// ---------------------------------------------------------------------------
-
-const classIndexEntrySize = 32
-
-// BinClassIndexEntry points from obfuscated class name into the DataBlock.
+// BinClassIndexEntry 将混淆类名指向 DataBlock 中对应的数据区域。
+// 仅包含查找和定位所需的字段；结构数量信息在每个类数据区域开头的
+// ClassDataHeader 中。
 type BinClassIndexEntry struct {
-	ObfName     uint32   // string pool offset of obfuscated class name
-	OriName     uint32   // string pool offset of original class name
-	DataOff     uint32   // offset within DataBlock to this class's data
-	MethodCount uint16   // number of methods
-	FieldCount  uint16   // number of fields
-	MetaCount   uint16   // number of class-level metadata entries
-	_           [10]byte // reserved / padding to 32 bytes
+	ObfName uint32 // 字符串池字节偏移（混淆类名）
+	OriName uint32 // 字符串池字节偏移（原始类名）
+	DataOff uint32 // 该类数据在 DataBlock 中的起始偏移
+	DataLen uint32 // 该类数据在 DataBlock 中的字节长度
 }
 
 // ---------------------------------------------------------------------------
-// DataBlock sub-entries (variable layout per class)
+// DataBlock 子条目（每个类的变长布局）
 //
-// Per class, the DataBlock contains:
-//   [MethodEntry * MethodCount]
-//   [FieldEntry * FieldCount]
-//   [MetadataEntry * MetaCount]        (class-level metadata)
-//
-// Per MethodEntry:
-//   Inline: the method's Lines and Frames follow contiguously after methods.
-//           MethodEntry.LineOff is relative to DataBlock start.
-//
-// Per-method line data at LineOff:
-//   [LineEntry * LineCount]
-//
-// Per LineEntry:
-//   FrameOff points to [FrameEntry * FrameCount] relative to DataBlock start.
-//
-// Per-method metadata at MetaOff:
-//   [MetadataEntry * MetaCount]
+// 每个类在 DataOff 处的布局：
+//   [ClassDataHeader]                (6B)
+//   [MethodEntry * MethodCount]      (28B 每条，先预留空间后回填)
+//   [FieldEntry  * FieldCount]       (12B 每条)
+//   每条类级别元数据：
+//     [条件列表]                      (变长 — [count:u16][pad:u16][字符串池偏移:u32*count])
+//     [动作列表]                      (变长 — 同上格式)
+//     [MetadataEntry]                (12B — ID + 指向上述列表的偏移)
+//   每个方法：
+//     [LineEntry * LineCount]        (14B 每条，先预留空间后回填)
+//     每个行号组：
+//       [FrameEntry * FrameCount]    (24B 每条)
+//     每条方法级别元数据：
+//       [条件列表]                    (变长)
+//       [动作列表]                    (变长)
+//       [MetadataEntry]              (12B)
 // ---------------------------------------------------------------------------
 
-const methodEntrySize = 32
+const classDataHeaderSize = 6
 
-// BinMethodEntry (32 bytes)
+// ClassDataHeader 写在每个类的 DataBlock 数据区域开头。
+type ClassDataHeader struct {
+	MethodCount uint16 // 方法数量
+	FieldCount  uint16 // 字段数量
+	MetaCount   uint16 // 类级别元数据数量
+}
+
+const methodEntrySize = 28
+
+// BinMethodEntry （28 字节）
 type BinMethodEntry struct {
-	ObfName   uint32  // string pool offset
-	OriName   uint32  // string pool offset
-	Return    uint32  // string pool offset
-	Args      uint32  // string pool offset
-	LineOff   uint32  // offset in DataBlock to LineEntry array
-	LineCount uint16  // number of line entries
-	MetaOff   uint32  // offset in DataBlock to method MetadataEntry array
-	MetaCount uint16  // number of method-level metadata entries
-	_         [4]byte // padding to 32 bytes
+	ObfName   uint32 // 字符串池字节偏移（混淆方法名）
+	OriName   uint32 // 字符串池字节偏移（原始方法名）
+	Return    uint32 // 字符串池字节偏移（返回类型）
+	Args      uint32 // 字符串池字节偏移（参数类型，逗号分隔）
+	LineOff   uint32 // DataBlock 偏移，指向 LineEntry 数组
+	LineCount uint16 // 行号条目数量
+	MetaOff   uint32 // DataBlock 偏移，指向方法级别元数据区域
+	MetaCount uint16 // 方法级别元数据条目数量
 }
 
 const fieldEntrySize = 12
 
-// BinFieldEntry (12 bytes)
+// BinFieldEntry （12 字节）
 type BinFieldEntry struct {
-	ObfName uint32 // string pool offset
-	OriName uint32 // string pool offset
-	Type    uint32 // string pool offset
+	ObfName uint32 // 字符串池字节偏移（混淆字段名）
+	OriName uint32 // 字符串池字节偏移（原始字段名）
+	Type    uint32 // 字符串池字节偏移（字段类型）
 }
 
-const lineEntrySize = 16
+const lineEntrySize = 14
 
-// BinLineEntry (16 bytes) — one obfuscated line range
+// BinLineEntry （14 字节）— 一个混淆行号范围
 type BinLineEntry struct {
-	ObfStart   uint32 // obfuscated line start
-	ObfEnd     uint32 // obfuscated line end
-	FrameOff   uint32 // offset in DataBlock to FrameEntry array
-	FrameCount uint16 // number of frames (>1 = inline)
-	_          [2]byte
+	ObfStart   uint32 // 混淆行号起始
+	ObfEnd     uint32 // 混淆行号结束
+	FrameOff   uint32 // DataBlock 偏移，指向 FrameEntry 数组
+	FrameCount uint16 // 帧数量（>1 表示内联）
 }
 
 const frameEntrySize = 24
 
-// BinFrameEntry (24 bytes) — one original frame
+// BinFrameEntry （24 字节）— 一个原始帧
 type BinFrameEntry struct {
-	OriClass  uint32 // string pool offset
-	OriMethod uint32 // string pool offset
-	Return    uint32 // string pool offset
-	Args      uint32 // string pool offset
-	OriStart  uint32 // original line start
-	OriEnd    uint32 // original line end
+	OriClass  uint32 // 字符串池字节偏移（原始类名）
+	OriMethod uint32 // 字符串池字节偏移（原始方法名）
+	Return    uint32 // 字符串池字节偏移（返回类型）
+	Args      uint32 // 字符串池字节偏移（参数类型）
+	OriStart  uint32 // 原始行号起始
+	OriEnd    uint32 // 原始行号结束
 }
 
 const metadataEntrySize = 12
 
-// BinMetadataEntry (12 bytes) — one metadata record
+// BinMetadataEntry （12 字节）— 一条元数据记录。
+// CondOff 和 ActOff 指向紧邻该条目之前写入的条件/动作列表。
 type BinMetadataEntry struct {
-	ID      uint32 // string pool offset of metadata ID string
-	CondOff uint32 // offset in DataBlock to conditions string ID array (uint32[])
-	ActOff  uint32 // offset in DataBlock to actions string ID array (uint32[])
+	ID      uint32 // 字符串池字节偏移（元数据 ID）
+	CondOff uint32 // DataBlock 偏移，指向条件列表
+	ActOff  uint32 // DataBlock 偏移，指向动作列表
 }
 
-// We encode condition/action counts in the first uint32 at CondOff/ActOff:
-//   [count:uint16][id0:uint32][id1:uint32]...
-// For simplicity, metadata condition/action blocks are:
-//   [count:uint16][padding:uint16][ids:uint32 * count]
-
+// 条件/动作列表布局：
+//
+//	[count:uint16][padding:uint16][字符串池偏移:uint32 * count]
+//
+// 每个偏移值是字符串池中的字节偏移。
 const metaListHeaderSize = 4 // uint16 count + uint16 padding
 
 // ---------------------------------------------------------------------------
-// String Pool binary format
+// Builder — 流式 AST -> 二进制构建器
 //
-// Strings are stored as: [uint16 length][bytes...]
-// Offset 0 is always the empty string: [0x00, 0x00] (length=0)
+// 用法：
+//
+//	builder := NewBuilder()
+//	builder.SetWriter(w)                    // 设置输出 writer
+//	ParseReaderStream(r, builder.OnClass)   // 流式解析（逐类写入 DataBlock）
+//	builder.Finalize()                      // 排序类索引
+//	builder.WriteIndex(w)                   // 写入 ClassIndex + StringPool
 // ---------------------------------------------------------------------------
 
-// BinStringPool is the serialized string pool.
-type BinStringPool struct {
-	data   []byte
-	lookup map[uint32]uint32 // IR string ID → byte offset in data
-}
+// Builder 从 ASTClass 对象流构建 Payload 二进制数据。
+//
+// 每次 OnClass 调用将一个类的数据序列化到临时缓冲区中，
+// 在本地完成所有回填后立即刷写到底层 writer。
+// 内存中仅保留 classIdx 和 strings。
+type Builder struct {
+	pool        *symx.StringPool
+	classIdx    []BinClassIndexEntry
+	w           io.Writer // DataBlock 流式写入的底层 writer
+	dataWritten uint32    // 已写入 w 的总字节数（即 DataBlock 大小）
 
-func newBinStringPool() *BinStringPool {
-	sp := &BinStringPool{
-		lookup: make(map[uint32]uint32),
-	}
-	// Offset 0: empty string (length 0)
-	sp.data = append(sp.data, 0, 0) // uint16(0)
-	sp.lookup[0] = 0
-	return sp
-}
-
-// put adds a string from the IR pool (by ID) to the binary pool.
-func (sp *BinStringPool) put(irID uint32, s string) uint32 {
-	if off, ok := sp.lookup[irID]; ok {
-		return off
-	}
-	if len(s) == 0 {
-		sp.lookup[irID] = 0
-		return 0
-	}
-	off := uint32(len(sp.data))
-	b := []byte(s)
-	lenBuf := make([]byte, 2)
-	binary.LittleEndian.PutUint16(lenBuf, uint16(len(b)))
-	sp.data = append(sp.data, lenBuf...)
-	sp.data = append(sp.data, b...)
-	sp.lookup[irID] = off
-	return off
-}
-
-// resolve maps an IR string ID to its binary pool offset.
-func (sp *BinStringPool) resolve(irID uint32) uint32 {
-	return sp.lookup[irID]
-}
-
-// ---------------------------------------------------------------------------
-// Builder: IR → Binary
-// ---------------------------------------------------------------------------
-
-// PGIdxBuilder builds a PGIDX binary file from an IRModule.
-type PGIdxBuilder struct {
-	strPool    *BinStringPool
-	classIndex []BinClassIndexEntry
-	dataBlock  *bytes.Buffer
-
-	// stats
+	// 统计信息
 	totalMethods  int
 	totalLines    int
 	totalMetadata int
 }
 
-// NewPGIdxBuilder creates a new builder.
-func NewPGIdxBuilder() *PGIdxBuilder {
-	return &PGIdxBuilder{
-		strPool:   newBinStringPool(),
-		dataBlock: new(bytes.Buffer),
+// NewBuilder 创建新的构建器。在流式调用 OnClass 之前需先调用 SetWriter。
+func NewBuilder() *Builder {
+	return &Builder{
+		pool: symx.NewStringPool(),
 	}
 }
 
-// Build populates the builder from an IRModule.
-func (b *PGIdxBuilder) Build(mod *IRModule) {
-	pool := mod.Pool
+// SetWriter 设置 DataBlock 流式写入的底层 writer。
+// 必须在第一次 OnClass 调用之前设置。
+func (b *Builder) SetWriter(w io.Writer) {
+	b.w = w
+}
 
-	// Phase 1: Intern all strings from IR into the binary string pool
-	for _, s := range pool.Strings() {
-		b.strPool.put(uint32(b.strPool.lookup[0]), s) // just pre-populate
+// OnClass 处理一个 ASTClass，将其二进制数据序列化到临时缓冲区，
+// 然后刷写到底层 writer。
+// 此方法用作 ParseReaderStream 的 OnClass 回调。
+func (b *Builder) OnClass(cls *ASTClass) error {
+	cw := &classWriter{baseOff: b.dataWritten}
+
+	classEntry := BinClassIndexEntry{
+		ObfName: b.str(cls.ObfName),
+		OriName: b.str(cls.OriName),
+		DataOff: b.dataWritten,
 	}
-	// Actually, we intern on-demand below via str() helper.
 
-	// Phase 2: Build class index + data block
-	for _, ic := range mod.Classes {
-		classEntry := BinClassIndexEntry{
-			ObfName:     b.str(pool, ic.ObfName),
-			OriName:     b.str(pool, ic.OriName),
-			DataOff:     uint32(b.dataBlock.Len()),
-			MethodCount: uint16(len(ic.Methods)),
-			FieldCount:  uint16(len(ic.Fields)),
-			MetaCount:   uint16(len(ic.Metadata)),
+	// 写入 ClassDataHeader（类数据区域开头）
+	hdr := ClassDataHeader{
+		MethodCount: uint16(len(cls.Methods)),
+		FieldCount:  uint16(len(cls.Fields)),
+		MetaCount:   uint16(len(cls.Metadata)),
+	}
+	_ = binary.Write(&cw.buf, binary.LittleEndian, &hdr)
+
+	// 预留方法条目空间（稍后回填）
+	methodLocalOff := cw.buf.Len()
+	methodEntries := make([]BinMethodEntry, len(cls.Methods))
+	for range cls.Methods {
+		cw.writeZeros(methodEntrySize)
+	}
+
+	// 写入字段条目
+	for _, f := range cls.Fields {
+		fe := BinFieldEntry{
+			ObfName: b.str(f.ObfName),
+			OriName: b.str(f.OriName),
+			Type:    b.str(f.Type),
+		}
+		_ = binary.Write(&cw.buf, binary.LittleEndian, &fe)
+	}
+
+	// 写入类级别元数据
+	for _, m := range cls.Metadata {
+		b.writeASTMetadata(cw, m)
+		b.totalMetadata++
+	}
+
+	// 写入每个方法的数据（行号、帧、方法元数据）
+	for i, am := range cls.Methods {
+		argsStr := joinArgs(am.Args)
+		me := BinMethodEntry{
+			ObfName:   b.str(am.ObfName),
+			OriName:   b.str(am.OriName),
+			Return:    b.str(am.Return),
+			Args:      b.str(argsStr),
+			LineCount: uint16(len(am.LineGroups)),
+			MetaCount: uint16(len(am.Metadata)),
+		}
+		b.totalMethods++
+
+		// 写入行号条目
+		me.LineOff = cw.globalOff()
+		lineLocalOff := cw.buf.Len()
+		lineEntries := make([]BinLineEntry, len(am.LineGroups))
+
+		// 预留行号条目空间（稍后回填）
+		for range am.LineGroups {
+			cw.writeZeros(lineEntrySize)
 		}
 
-		// Write method entries (placeholders, then fill offsets)
-		methodBaseOff := b.dataBlock.Len()
-		methodEntries := make([]BinMethodEntry, len(ic.Methods))
-
-		// Reserve space for method entries
-		for i := range ic.Methods {
-			_ = i
-			b.writeZeros(methodEntrySize)
-		}
-
-		// Write field entries
-		for _, f := range ic.Fields {
-			fe := BinFieldEntry{
-				ObfName: b.str(pool, f.ObfName),
-				OriName: b.str(pool, f.OriName),
-				Type:    b.str(pool, f.Type),
+		// 写入每个行号组的帧数据
+		for li, lg := range am.LineGroups {
+			lineEntries[li] = BinLineEntry{
+				ObfStart:   uint32(lg.ObfStart),
+				ObfEnd:     uint32(lg.ObfEnd),
+				FrameOff:   cw.globalOff(),
+				FrameCount: uint16(len(lg.Frames)),
 			}
-			_ = binary.Write(b.dataBlock, binary.LittleEndian, &fe)
+			b.totalLines++
+
+			for _, fr := range lg.Frames {
+				fe := BinFrameEntry{
+					OriClass:  b.str(fr.OriClass),
+					OriMethod: b.str(fr.OriMethod),
+					Return:    b.str(fr.Return),
+					Args:      b.str(joinArgs(fr.Args)),
+					OriStart:  uint32(fr.OriStart),
+					OriEnd:    uint32(fr.OriEnd),
+				}
+				_ = binary.Write(&cw.buf, binary.LittleEndian, &fe)
+			}
 		}
 
-		// Write class-level metadata
-		for _, m := range ic.Metadata {
-			b.writeMetadata(pool, m)
+		// 回填行号条目
+		cw.backfillLineEntries(lineLocalOff, lineEntries)
+
+		// 写入方法级别元数据
+		me.MetaOff = cw.globalOff()
+		for _, m := range am.Metadata {
+			b.writeASTMetadata(cw, m)
 			b.totalMetadata++
 		}
 
-		// Write per-method data (lines, frames, method metadata)
-		for i, im := range ic.Methods {
-			me := BinMethodEntry{
-				ObfName:   b.str(pool, im.ObfName),
-				OriName:   b.str(pool, im.OriName),
-				Return:    b.str(pool, im.Return),
-				Args:      b.str(pool, im.Args),
-				LineCount: uint16(len(im.Lines)),
-				MetaCount: uint16(len(im.Metadata)),
-			}
-			b.totalMethods++
-
-			// Write line entries for this method
-			me.LineOff = uint32(b.dataBlock.Len())
-			lineEntries := make([]BinLineEntry, len(im.Lines))
-
-			// Reserve space for line entries
-			for range im.Lines {
-				b.writeZeros(lineEntrySize)
-			}
-
-			// Write frames for each line
-			for li, il := range im.Lines {
-				lineEntries[li] = BinLineEntry{
-					ObfStart:   uint32(il.ObfStart),
-					ObfEnd:     uint32(il.ObfEnd),
-					FrameOff:   uint32(b.dataBlock.Len()),
-					FrameCount: uint16(len(il.Frames)),
-				}
-				b.totalLines++
-
-				for _, fr := range il.Frames {
-					fe := BinFrameEntry{
-						OriClass:  b.str(pool, fr.OriClass),
-						OriMethod: b.str(pool, fr.OriMethod),
-						Return:    b.str(pool, fr.Return),
-						Args:      b.str(pool, fr.Args),
-						OriStart:  uint32(fr.OriStart),
-						OriEnd:    uint32(fr.OriEnd),
-					}
-					_ = binary.Write(b.dataBlock, binary.LittleEndian, &fe)
-				}
-			}
-
-			// Backfill line entries
-			b.backfillLineEntries(me.LineOff, lineEntries)
-
-			// Write method-level metadata
-			me.MetaOff = uint32(b.dataBlock.Len())
-			for _, m := range im.Metadata {
-				b.writeMetadata(pool, m)
-				b.totalMetadata++
-			}
-
-			methodEntries[i] = me
-		}
-
-		// Backfill method entries
-		b.backfillMethodEntries(uint32(methodBaseOff), methodEntries)
-
-		b.classIndex = append(b.classIndex, classEntry)
+		methodEntries[i] = me
 	}
 
-	// Sort class index by obfuscated class name (for binary search)
-	sort.Slice(b.classIndex, func(i, j int) bool {
-		si := b.readStringAt(b.classIndex[i].ObfName)
-		sj := b.readStringAt(b.classIndex[j].ObfName)
+	// 回填方法条目
+	cw.backfillMethodEntries(methodLocalOff, methodEntries)
+
+	classEntry.DataLen = uint32(cw.buf.Len())
+
+	// 刷写到底层 writer
+	n, err := b.w.Write(cw.buf.Bytes())
+	b.dataWritten += uint32(n)
+	if err != nil {
+		return fmt.Errorf("flushing class data: %w", err)
+	}
+
+	b.classIdx = append(b.classIdx, classEntry)
+	return nil
+}
+
+// str 将字符串放入池中，返回其字节偏移。
+func (b *Builder) str(s string) uint32 {
+	return b.pool.Put(s)
+}
+
+// writeASTMetadata 写入一条 ASTMetadata 及其条件/动作列表。
+func (b *Builder) writeASTMetadata(cw *classWriter, m *ASTMetadata) {
+	condOff := cw.globalOff()
+	b.writeStringList(cw, m.Conditions)
+
+	actOff := cw.globalOff()
+	b.writeStringList(cw, m.Actions)
+
+	me := BinMetadataEntry{
+		ID:      b.str(m.ID),
+		CondOff: condOff,
+		ActOff:  actOff,
+	}
+	_ = binary.Write(&cw.buf, binary.LittleEndian, &me)
+}
+
+// writeStringList 写入 [count:uint16][pad:uint16][字符串池偏移:uint32*count] 格式的列表。
+func (b *Builder) writeStringList(cw *classWriter, ss []string) {
+	count := uint16(len(ss))
+	_ = binary.Write(&cw.buf, binary.LittleEndian, count)
+	_ = binary.Write(&cw.buf, binary.LittleEndian, uint16(0)) // 填充对齐
+	for _, s := range ss {
+		off := b.str(s)
+		_ = binary.Write(&cw.buf, binary.LittleEndian, off)
+	}
+}
+
+// readStringAt 从字符串池中读取指定字节偏移处的字符串。
+func (b *Builder) readStringAt(off uint32) string {
+	return b.pool.ReadAt(off)
+}
+
+// Finalize 按混淆类名排序类索引，以支持二分查找。
+// 必须在所有 OnClass 调用完成后、WriteIndex 之前调用。
+func (b *Builder) Finalize() {
+	sort.Slice(b.classIdx, func(i, j int) bool {
+		si := b.readStringAt(b.classIdx[i].ObfName)
+		sj := b.readStringAt(b.classIdx[j].ObfName)
 		return si < sj
 	})
 }
 
-// str interns an IR string ID into the binary string pool and returns the binary offset.
-func (b *PGIdxBuilder) str(pool *IRStringPool, irID uint32) uint32 {
-	s := pool.Get(irID)
-	return b.strPool.put(irID, s)
-}
+// WriteIndex 写入 ClassIndex 和 StringPool（DataBlock 已在 OnClass 过程中写入）。
+// 返回写入的字节数。
+func (b *Builder) WriteIndex(w io.Writer) (int64, error) {
+	var total int64
 
-// writeZeros writes n zero bytes to the data block.
-func (b *PGIdxBuilder) writeZeros(n int) {
-	zeros := make([]byte, n)
-	b.dataBlock.Write(zeros)
-}
-
-// writeMetadata writes a metadata entry + its condition/action lists.
-func (b *PGIdxBuilder) writeMetadata(pool *IRStringPool, m *IRMetadata) {
-	condOff := uint32(b.dataBlock.Len())
-	b.writeIDList(m.Conditions, pool)
-
-	actOff := uint32(b.dataBlock.Len())
-	b.writeIDList(m.Actions, pool)
-
-	me := BinMetadataEntry{
-		ID:      b.str(pool, m.ID),
-		CondOff: condOff,
-		ActOff:  actOff,
-	}
-	binary.Write(b.dataBlock, binary.LittleEndian, &me)
-}
-
-// writeIDList writes a [count:uint16][pad:uint16][ids:uint32*count] block.
-func (b *PGIdxBuilder) writeIDList(ids []uint32, pool *IRStringPool) {
-	count := uint16(len(ids))
-	_ = binary.Write(b.dataBlock, binary.LittleEndian, count)
-	_ = binary.Write(b.dataBlock, binary.LittleEndian, uint16(0)) // padding
-	for _, id := range ids {
-		spOff := b.str(pool, id)
-		_ = binary.Write(b.dataBlock, binary.LittleEndian, spOff)
-	}
-}
-
-// backfillMethodEntries overwrites the reserved method entry slots.
-func (b *PGIdxBuilder) backfillMethodEntries(baseOff uint32, entries []BinMethodEntry) {
-	data := b.dataBlock.Bytes()
-	for i, me := range entries {
-		off := int(baseOff) + i*methodEntrySize
-		buf := new(bytes.Buffer)
-		binary.Write(buf, binary.LittleEndian, &me)
-		copy(data[off:off+methodEntrySize], buf.Bytes())
-	}
-}
-
-// backfillLineEntries overwrites the reserved line entry slots.
-func (b *PGIdxBuilder) backfillLineEntries(baseOff uint32, entries []BinLineEntry) {
-	data := b.dataBlock.Bytes()
-	for i, le := range entries {
-		off := int(baseOff) + i*lineEntrySize
-		buf := new(bytes.Buffer)
-		binary.Write(buf, binary.LittleEndian, &le)
-		copy(data[off:off+lineEntrySize], buf.Bytes())
-	}
-}
-
-// readStringAt reads a string from the binary string pool at the given offset.
-func (b *PGIdxBuilder) readStringAt(off uint32) string {
-	if int(off)+2 > len(b.strPool.data) {
-		return ""
-	}
-	length := binary.LittleEndian.Uint16(b.strPool.data[off : off+2])
-	if length == 0 {
-		return ""
-	}
-	start := off + 2
-	end := start + uint32(length)
-	if int(end) > len(b.strPool.data) {
-		return ""
-	}
-	return string(b.strPool.data[start:end])
-}
-
-// WriteTo serializes the complete PGIDX binary to the writer.
-func (b *PGIdxBuilder) WriteTo(w io.Writer) error {
-	buf := new(bytes.Buffer)
-
-	// 1. Reserve header
-	buf.Write(make([]byte, headerSize))
-
-	// 2. Write ClassIndex
-	classIdxOff := uint32(buf.Len())
-	for i := range b.classIndex {
-		if err := binary.Write(buf, binary.LittleEndian, &b.classIndex[i]); err != nil {
-			return fmt.Errorf("writing class index entry %d: %w", i, err)
+	// 写入 ClassIndex（已排序）
+	for i := range b.classIdx {
+		if err := binary.Write(w, binary.LittleEndian, &b.classIdx[i]); err != nil {
+			return total, fmt.Errorf("writing class index entry %d: %w", i, err)
 		}
+		total += classIndexEntrySize
 	}
 
-	// 3. Write DataBlock
-	dataBlockOff := uint32(buf.Len())
-	dataBlockLen := uint32(b.dataBlock.Len())
-	buf.Write(b.dataBlock.Bytes())
-
-	// 4. Write StringPool
-	strPoolOff := uint32(buf.Len())
-	strPoolLen := uint32(len(b.strPool.data))
-	buf.Write(b.strPool.data)
-
-	// 5. Backfill header
-	header := BinHeader{
-		Magic:         [4]byte{'P', 'G', 'I', 'X'},
-		Version:       pgidxVersion,
-		ClassCount:    uint32(len(b.classIndex)),
-		ClassIdxOff:   classIdxOff,
-		DataBlockOff:  dataBlockOff,
-		DataBlockLen:  dataBlockLen,
-		StringPoolOff: strPoolOff,
-		StringPoolLen: strPoolLen,
-		TotalMethods:  uint32(b.totalMethods),
-		TotalLines:    uint32(b.totalLines),
-		TotalMetadata: uint32(b.totalMetadata),
+	// 写入 StringPool
+	n, err := w.Write(b.pool.Bytes())
+	total += int64(n)
+	if err != nil {
+		return total, fmt.Errorf("writing string pool: %w", err)
 	}
-	hdrBuf := new(bytes.Buffer)
-	if err := binary.Write(hdrBuf, binary.LittleEndian, &header); err != nil {
-		return fmt.Errorf("serializing header: %w", err)
-	}
-	final := buf.Bytes()
-	copy(final[:headerSize], hdrBuf.Bytes())
 
-	_, err := w.Write(final)
-	return err
+	return total, nil
 }
 
-// Stats returns a human-readable summary.
-func (b *PGIdxBuilder) Stats() string {
+// FillMetadata 用 Payload 布局信息填充 Metadata 结构体。
+func (b *Builder) FillMetadata(meta *Metadata) {
+	meta.ClassCount = uint32(len(b.classIdx))
+	meta.DataBlockLen = b.dataWritten
+	meta.StringPoolLen = uint32(b.pool.Len())
+	meta.TotalMethods = uint32(b.totalMethods)
+	meta.TotalLines = uint32(b.totalLines)
+	meta.TotalMetadata = uint32(b.totalMetadata)
+}
+
+// Stats 返回人类可读的统计摘要。
+func (b *Builder) Stats() string {
 	return fmt.Sprintf("classes=%d methods=%d lines=%d metadata=%d strPoolSize=%d dataBlockSize=%d",
-		len(b.classIndex), b.totalMethods, b.totalLines, b.totalMetadata,
-		len(b.strPool.data), b.dataBlock.Len())
+		len(b.classIdx), b.totalMethods, b.totalLines, b.totalMetadata,
+		b.pool.Len(), b.dataWritten)
+}
+
+// ---------------------------------------------------------------------------
+// classWriter — 单个类的临时缓冲区，带全局偏移量追踪。
+// ---------------------------------------------------------------------------
+
+type classWriter struct {
+	buf     bytes.Buffer
+	baseOff uint32 // 该类在 DataBlock 中的全局起始偏移
+}
+
+// globalOff 返回当前的 DataBlock 全局偏移。
+func (cw *classWriter) globalOff() uint32 {
+	return cw.baseOff + uint32(cw.buf.Len())
+}
+
+// writeZeros 写入 n 个零字节。
+func (cw *classWriter) writeZeros(n int) {
+	cw.buf.Write(make([]byte, n))
+}
+
+// backfillMethodEntries 回填预留的方法条目槽位。
+func (cw *classWriter) backfillMethodEntries(localOff int, entries []BinMethodEntry) {
+	raw := cw.buf.Bytes()
+	for i, me := range entries {
+		off := localOff + i*methodEntrySize
+		buf := new(bytes.Buffer)
+		_ = binary.Write(buf, binary.LittleEndian, &me)
+		copy(raw[off:off+methodEntrySize], buf.Bytes())
+	}
+}
+
+// backfillLineEntries 回填预留的行号条目槽位。
+func (cw *classWriter) backfillLineEntries(localOff int, entries []BinLineEntry) {
+	raw := cw.buf.Bytes()
+	for i, le := range entries {
+		off := localOff + i*lineEntrySize
+		buf := new(bytes.Buffer)
+		_ = binary.Write(buf, binary.LittleEndian, &le)
+		copy(raw[off:off+lineEntrySize], buf.Bytes())
+	}
+}
+
+// joinArgs 将参数类型列表用 ',' 连接，用于字符串池去重。
+func joinArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return strings.Join(args, ",")
 }

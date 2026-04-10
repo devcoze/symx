@@ -24,7 +24,8 @@ const (
 )
 
 var (
-	ErrInvalidMagic = errors.New("symx: invalid magic number")
+	ErrInvalidMagic    = errors.New("symx: invalid magic number")
+	ErrInvalidFileType = errors.New("symx: invalid file type")
 )
 
 // Magic SYMX 表示协议魔数，固定为 "SYMX"，用于标识 SymX 协议的文件头。

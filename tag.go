@@ -340,7 +340,12 @@ func MarshalTLVs(v any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 0, MarshalTLVsSize(v))
+	// 直接从已解析的 fields 计算总大小，避免重复反射
+	total := 0
+	for _, field := range fields {
+		total += TLVSize(field.valueSize)
+	}
+	buf := make([]byte, 0, total)
 	for _, field := range fields {
 		valBytes, err := marshalFieldBytes(field.value)
 		if err != nil {

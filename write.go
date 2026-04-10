@@ -16,13 +16,13 @@ type WriteOptions struct {
 	BuildID  string // 原始 BuildID，由 NormalizeBuildID 规范化为 16 字节
 }
 
-func NewOptions(input string, output string, ft uint8) *WriteOptions {
+// NewOptions 创建一个新的 WriteOptions 实例，接受输入输出路径、文件类型和 BuildID 作为参数。
+func NewOptions(input string, output string, ft uint8, bid string) *WriteOptions {
 	return &WriteOptions{
-		Input:    "",
-		Output:   "",
-		FileType: 0,
-		Version:  0,
-		BuildID:  "",
+		Input:    input,
+		Output:   output,
+		FileType: ft,
+		BuildID:  bid,
 	}
 }
 
@@ -121,7 +121,7 @@ func Write(opts *WriteOptions, f EncoderFactory) (WriteResult, error) {
 	}
 
 	cw := &CountingWriter{w: t}
-	var result WriteResult
+	var wr WriteResult
 
 	// 序列化固定头（栈上 32 字节，一次性写入）
 	var buf [FixedSize]byte
@@ -132,38 +132,35 @@ func Write(opts *WriteOptions, f EncoderFactory) (WriteResult, error) {
 	binary.LittleEndian.PutUint64(buf[PayloadLenOffset:], hdr.PayloadLen)
 	copy(buf[BuildIDOffset:], hdr.BuildID[:])
 
+	// 写入 FixedHeader
 	if _, err := cw.Write(buf[:]); err != nil {
-		return result, err
+		return wr, err
 	}
-	result.FixedHeadBytes = cw.n
+	wr.FixedHeadBytes = cw.n
 
-	// 流式写入扩展头和有效负载，无需整体缓冲，直接写入 w。
-	if hdr.ExtLen > 0 {
-		before := cw.n
-		if err := enc.WriteExtHead(cw); err != nil {
-			return result, err
-		}
-		result.ExtHeadBytes = cw.n - before
-		result.PatchBindings = append(result.PatchBindings, cw.patches...)
+	// 写入ExtHead，并记录实际写入的字节数和 PatchBinding 信息。
+	before := cw.n
+	if err := enc.WriteExtHead(cw); err != nil {
+		return wr, err
 	}
+	wr.ExtHeadBytes = cw.n - before
+	wr.PatchBindings = append(wr.PatchBindings, cw.patches...)
 
-	// PayloadSize 可能依赖于 WriteExtHead 的结果，因此在写入前再次确认 PayloadLen 是否正确。
-	if hdr.PayloadLen > 0 {
-		before := cw.n
-		if err := enc.WritePayload(cw); err != nil {
-			return result, err
-		}
-		result.PayloadBytes = cw.n - before
+	// 写入Payload，并记录实际写入的字节数
+	before = cw.n
+	if err := enc.WritePayload(cw); err != nil {
+		return wr, err
 	}
+	wr.PayloadBytes = cw.n - before
 
 	// 触发 Encoder 自身回调（可选实现）
 	if aw, ok := enc.(AfterWriter); ok {
-		if err := aw.AfterWrite(t, result); err != nil {
-			return result, err
+		if err := aw.AfterWrite(t, wr); err != nil {
+			return wr, err
 		}
 	}
 
-	return result, nil
+	return wr, nil
 }
 
 // WriteExtLen 更新固定头中 ExtLen，

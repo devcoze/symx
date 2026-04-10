@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 )
@@ -29,6 +28,7 @@ const (
 	arrowLen      = len(arrow)
 )
 
+// OnClass 是一个回调函数类型，用于在解析过程中输出每个解析到的 ASTClass 对象。
 type OnClass func(cls *ASTClass) error
 
 // ---------------------------------------------------------------------------
@@ -97,16 +97,6 @@ type ASTMetadata struct {
 // Parser
 // ---------------------------------------------------------------------------
 
-// Parse 读取指定路径的 ProGuard/R8 mapping.txt 文件，并返回解析后的 ASTClass 列表。
-func Parse(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("opening mapping file: %w", err)
-	}
-	defer f.Close()
-	return ParseReaderStream(f, nil)
-}
-
 // ParseReaderStream 从给定的 io.Reader 逐行解析 ProGuard/R8 mapping 数据，并通过 onClass 回调输出每个解析到的 ASTClass 对象。
 func ParseReaderStream(r io.Reader, onClass OnClass) error {
 	if onClass == nil {
@@ -118,16 +108,16 @@ func ParseReaderStream(r io.Reader, onClass OnClass) error {
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineLength)
 
 	var (
-		curClass  *ASTClass
+		curCls    *ASTClass
 		curMethod *ASTMethod
 		lineNo    int // 当前行号，用于错误报告和调试
 	)
 
-	emitClass := func() error {
-		if curClass == nil {
+	emitCls := func() error {
+		if curCls == nil {
 			return nil
 		}
-		if err := onClass(curClass); err != nil {
+		if err := onClass(curCls); err != nil {
 			return err
 		}
 		return nil
@@ -149,8 +139,8 @@ func ParseReaderStream(r io.Reader, onClass OnClass) error {
 			if meta := tryParseMetadata(trimmed); meta != nil {
 				if curMethod != nil {
 					curMethod.Metadata = append(curMethod.Metadata, meta)
-				} else if curClass != nil {
-					curClass.Metadata = append(curClass.Metadata, meta)
+				} else if curCls != nil {
+					curCls.Metadata = append(curCls.Metadata, meta)
 				}
 				continue
 			}
@@ -166,20 +156,20 @@ func ParseReaderStream(r io.Reader, onClass OnClass) error {
 				continue
 			}
 			// 遇到新类时，先将之前的类（如果有）通过回调输出，然后开始解析新类
-			if err := emitClass(); err != nil {
+			if err := emitCls(); err != nil {
 				return err
 			}
-			curClass = c
+			curCls = c
 			curMethod = nil
 			continue
 		}
 
 		// 此时应该是方法或字段，但如果 curClass 为空，说明没有有效的类上下文，skip.
-		if curClass == nil {
+		if curCls == nil {
 			continue
 		}
 		// 方法或字段：有前导空格，且包含 " -> "
-		parseMemberLine(curClass, &curMethod, line, lineNo)
+		parseMemberLine(curCls, &curMethod, line, lineNo)
 	}
 
 	// 检查扫描过程中是否发生错误
@@ -187,7 +177,8 @@ func ParseReaderStream(r io.Reader, onClass OnClass) error {
 		return fmt.Errorf("scanning mapping file: %w", err)
 	}
 
-	if err := emitClass(); err != nil {
+	// 最后一个类也需要通过回调输出
+	if err := emitCls(); err != nil {
 		return err
 	}
 

@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"time"
 
@@ -12,58 +13,63 @@ import (
 )
 
 const (
-	VersionKey    = "version"
-	SourceRootKey = "sourceRoot"
-	FileKey       = "file"
-	MappingsKey   = "mappings"
+	versionKey    = "version"
+	sourceRootKey = "sourceRoot"
+	fileKey       = "file"
+	mappingsKey   = "mappings"
 )
 
-// Encoder 负责将 SourceMap 数据编码为 SymX 格式。它实现了 engine.Encoder 接口，包含必要的元数据和索引信息以供写入使用。
+// Encoder 负责将 SourceMap 数据编码为 SymX 格式。它实现了 symx.Encoder 接口，包含必要的元数据和索引信息以供写入使用。
 type Encoder struct {
-	opts     *symx.WriteOptions
-	data     []byte
-	meta     Metadata
-	Segments []Segment
-	Lines    []Line
+	opts *symx.WriteOptions
+	data []byte
+	meta Metadata
 }
 
 // NewEncoder 创建一个新的 Encoder 实例，接受 WriteOptions 作为参数以配置输入输出路径。
-func NewEncoder(opts *symx.WriteOptions) *Encoder {
+func NewEncoder(opts *symx.WriteOptions) (*Encoder, error) {
 	data, err := os.ReadFile(opts.Input)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-
-	meta := Metadata{
-		CompileTime: uint64(time.Now().UnixMilli()),
-	}
-
-	meta.OriFile = opts.Input
-
-	// 版本，目前应该都是 3
-	version, err := extractKey(data, VersionKey)
-	if version != "" {
-		meta.Version = version
-	}
-
-	// SourceRoot
-	sourceRoot, err := extractKey(data, SourceRootKey)
-	if sourceRoot != "" {
-		meta.SourceRoot = sourceRoot
-	}
-
-	// file
-	filename, err := extractKey(data, FileKey)
-	if filename != "" {
-		meta.OriFile = filename
-	}
-
 	enc := &Encoder{
 		opts: opts,
 		data: data,
-		meta: meta,
+		meta: Metadata{
+			CompileTime: uint64(time.Now().UnixMilli()),
+			OriFile:     opts.Output,
+		},
 	}
-	return enc
+	err = enc.scanMetadata()
+	if err != nil {
+		return nil, err
+	}
+	return enc, nil
+}
+
+// scanMetadata 从 SourceMap JSON 数据中提取版本、SourceRoot 和原始文件路径等元数据信息。
+func (e *Encoder) scanMetadata() error {
+	// 版本，目前应该都是 3
+	version, err := extractKey(e.data, versionKey)
+	if err != nil {
+		return err
+	}
+	e.meta.Version = version
+
+	// SourceRoot
+	sourceRoot, err := extractKey(e.data, sourceRootKey)
+	if err != nil {
+		return err
+	}
+	e.meta.SourceRoot = sourceRoot
+
+	// file
+	filename, err := extractKey(e.data, fileKey)
+	if err != nil {
+		return err
+	}
+	e.meta.OriFile = filename
+	return nil
 }
 
 // FileType 返回文件类型标识（SourceMap）。
@@ -98,17 +104,17 @@ func (e *Encoder) WriteExtHead(cw *symx.CountingWriter) error {
 // WritePayload 将文件类型特有的索引数据流式写入 w。写入的字节数必须等于 PayloadSize() 的返回值。
 func (e *Encoder) WritePayload(cw *symx.CountingWriter) error {
 	// mappings
-	mappings, err := extractKey(e.data, MappingsKey)
+	mappings, err := extractKey(e.data, mappingsKey)
 	if err != nil {
 		return err
 	}
 	segments, lines := parseMappings(mappings)
 
 	// 写入行
-	e.meta.LineOff = uint64(cw.Offset())
+	e.meta.LineOff = uint32(cw.Offset())
 	e.meta.LineCnt = uint32(len(lines))
 	var lineBuf [lineSize]byte
-	for _, line := range e.Lines {
+	for _, line := range lines {
 		binary.LittleEndian.PutUint32(lineBuf[0:4], line.Start)
 		binary.LittleEndian.PutUint32(lineBuf[4:8], line.End)
 		if _, err := cw.Write(lineBuf[:]); err != nil {
@@ -117,10 +123,10 @@ func (e *Encoder) WritePayload(cw *symx.CountingWriter) error {
 	}
 
 	// 写入段
-	e.meta.SegmentOff = uint64(cw.Offset())
+	e.meta.SegmentOff = uint32(cw.Offset())
 	e.meta.SegmentCnt = uint32(len(segments))
 	var segmentBuf [segmentSize]byte
-	for _, segment := range e.Segments {
+	for _, segment := range segments {
 		binary.LittleEndian.PutUint32(segmentBuf[0:4], segment.GenCol)
 		binary.LittleEndian.PutUint32(segmentBuf[4:8], segment.SrcIdx)
 		binary.LittleEndian.PutUint32(segmentBuf[8:12], segment.SrcLine)
@@ -132,9 +138,16 @@ func (e *Encoder) WritePayload(cw *symx.CountingWriter) error {
 	return nil
 }
 
-// AfterWrite 是一个回调函数，在文件写入完成后被调用
+// AfterWrite 是一个回调函数，在文件写入完成后被调用。
+// 它回填 ExtHead 中 Update TLV 字段的实际值，并修正 FixedHead 中的 PayloadLen 字段。
 func (e *Encoder) AfterWrite(w *os.File, wr symx.WriteResult) error {
-	return symx.ApplyPatchBindings(w, &e.meta, wr.PatchBindings)
+	if err := symx.ApplyPatchBindings(w, &e.meta, wr.PatchBindings); err != nil {
+		return err
+	}
+	if _, err := symx.CorrectPayloadLen(w, wr.PayloadBytes); err != nil {
+		return err
+	}
+	return nil
 }
 
 // extractKey 从 SourceMap JSON 数据中提取指定键的字符串值，使用 sonic 库进行高效的 JSON 解析，避免全量反序列化。
@@ -144,4 +157,17 @@ func extractKey(data []byte, key string) (string, error) {
 		return "", err
 	}
 	return n.String()
+}
+
+// NewEncoderFactory 创建一个 EncoderFactory 闭包，
+// 将 Options 绑定到工厂函数中，适配 symx.EncoderFactory 签名。
+func NewEncoderFactory() symx.EncoderFactory {
+	return func(opts *symx.WriteOptions) symx.Encoder {
+		enc, err := NewEncoder(opts)
+		if err != nil {
+			// EncoderFactory 无法返回 error，panic 表示编程错误
+			panic(fmt.Sprintf("proguard: NewEncoder failed: %v", err))
+		}
+		return enc
+	}
 }

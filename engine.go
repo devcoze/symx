@@ -22,7 +22,7 @@ func Open(filePath string) (*Engine, error) {
 
 	// 固定头部的大小
 	if len(mappedBytes) < FixedSize {
-		unmapBytes(mappedBytes)
+		_ = unmapBytes(mappedBytes)
 		return nil, fmt.Errorf("file too small to contain Symx Fixed Header: size=%d", len(mappedBytes))
 	}
 
@@ -33,7 +33,7 @@ func Open(filePath string) (*Engine, error) {
 	// 解析固定头部信息
 	fh, err := ParseFixedHeader(mappedBytes[:FixedSize])
 	if err != nil {
-		unmapBytes(mappedBytes)
+		_ = unmapBytes(mappedBytes)
 		return nil, err
 	}
 	e.fh = fh
@@ -41,21 +41,21 @@ func Open(filePath string) (*Engine, error) {
 	// 校验固定头部的 Magic 字段，确保文件格式正确
 	err = fh.Validate()
 	if err != nil {
-		unmapBytes(mappedBytes)
+		_ = unmapBytes(mappedBytes)
 		return nil, err
 	}
 
 	// 拓展头结束位置
 	extHeadEnd, _, err := e.sectionBounds()
 	if err != nil {
-		unmapBytes(mappedBytes)
+		_ = unmapBytes(mappedBytes)
 		return nil, err
 	}
 
 	// 解析拓展头部信息
 	eh, err := ParseExtendedHeader(mappedBytes[FixedSize:extHeadEnd])
 	if err != nil {
-		unmapBytes(mappedBytes)
+		_ = unmapBytes(mappedBytes)
 		return nil, err
 	}
 
@@ -65,35 +65,47 @@ func Open(filePath string) (*Engine, error) {
 
 // Close 释放引擎占用的资源，主要是解除内存映射。
 func (e *Engine) Close() error {
-	unmapBytes(e.bytes)
+	err := unmapBytes(e.bytes)
 	e.bytes = nil
-	return nil
+	return err
 }
 
-// ReadAt 从内存映射的字节切片中读取数据到给定的缓冲区 b 中，从指定的偏移 off 开始。返回实际读取的字节数和可能的错误。
-func (e *Engine) ReadAt(b []byte, off int64) (int, error) {
-	end := off + int64(len(b))
-	if end > int64(len(e.bytes)) {
-		return 0, fmt.Errorf("read out of bounds: offset=%d + len=%d exceeds file size %d", off, len(b), len(e.bytes))
-	}
-	copy(b, e.bytes[off:end])
-	return len(b), nil
+// ExtData 返回扩展头部的原始 TLV 字节切片（零拷贝，直接引用 mmap 内存）。
+// 供 Decoder 使用 UnmarshalTLVs 反序列化类型特定的 Metadata。
+func (e *Engine) ExtData() []byte {
+	extHeadEnd := FixedSize + int(e.fh.ExtLen)
+	return e.bytes[FixedSize:extHeadEnd]
+}
+
+// PayloadData 返回有效负载的原始字节切片（零拷贝，直接引用 mmap 内存）。
+// 供 Decoder 按 Metadata 中记录的布局信息访问 DataBlock、ClassIndex、StringPool。
+func (e *Engine) PayloadData() []byte {
+	extHeadEnd := FixedSize + int(e.fh.ExtLen)
+	return e.bytes[extHeadEnd:]
+}
+
+// FixedHeader 返回已解析的固定头部信息。
+func (e *Engine) FixedHeader() FixedHead {
+	return e.fh
+}
+
+// FileType 返回文件类型字段，供 Decoder 根据类型信息选择合适的解析器进行后续处理。
+func (e *Engine) FileType() uint8 {
+	return e.fh.FileType
+}
+
+// ExtendedHeader 返回已解析的扩展头部信息。
+func (e *Engine) ExtendedHeader() ExtendedHead {
+	return e.eh
 }
 
 // sectionBounds 计算并返回头部扩展区间的结束位置和数据体长度，并验证文件布局的正确性。
+// 前置条件：调用方已确保 len(e.bytes) >= FixedSize 且 e.fh.Validate() 通过。
 // 返回值包括：
 // - extHeadEnd: 扩展头部结束位置，即固定头部大小加上扩展头部长度
 // - payloadLen: 数据体长度，从固定头部的 PayloadLen 字段获取
-// - error: 如果文件布局不合法或验证失败，则返回一个错误
+// - error: 如果文件布局不合法，则返回一个错误
 func (e *Engine) sectionBounds() (int, int, error) {
-	if len(e.bytes) < FixedSize {
-		return 0, 0, fmt.Errorf("file too small to contain SymxHeader")
-	}
-
-	if err := e.fh.Validate(); err != nil {
-		return 0, 0, err
-	}
-
 	extLen := int(e.fh.ExtLen)
 	payloadLen := int(e.fh.PayloadLen)
 	extHeadEnd := FixedSize + extLen
